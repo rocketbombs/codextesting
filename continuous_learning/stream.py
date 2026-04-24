@@ -46,32 +46,104 @@ class ProgressiveDriftTransform:
 class StreamSample:
     x: torch.Tensor
     y: int
+    task_id: int
 
 
-class OnlineMNISTStream:
-    def __init__(self, data_dir: str, batch_size: int, num_workers: int, total_steps: int) -> None:
+class OnlineSplitCIFAR10Stream:
+    def __init__(
+        self,
+        data_dir: str,
+        batch_size: int,
+        eval_batch_size: int,
+        num_workers: int,
+        total_steps: int,
+        classes_per_task: int,
+    ) -> None:
         self.transform = ProgressiveDriftTransform(total_steps=total_steps)
-        self.dataset = datasets.MNIST(root=data_dir, train=True, download=True)
-        self.loader = DataLoader(
-            self.dataset,
+        self.train_dataset = datasets.CIFAR10(
+            root=data_dir,
+            train=True,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
+        self.test_dataset = datasets.CIFAR10(
+            root=data_dir,
+            train=False,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
+        self.classes_per_task = max(1, classes_per_task)
+        class_order = list(range(10))
+        self.task_splits = [
+            class_order[i : i + self.classes_per_task]
+            for i in range(0, len(class_order), self.classes_per_task)
+        ]
+
+        self.task_loaders = self._build_task_loaders(
+            dataset=self.train_dataset,
             batch_size=batch_size,
-            shuffle=True,
             num_workers=num_workers,
+            shuffle=True,
             drop_last=True,
         )
+        self.task_eval_loaders = self._build_task_loaders(
+            dataset=self.test_dataset,
+            batch_size=eval_batch_size,
+            num_workers=num_workers,
+            shuffle=False,
+            drop_last=False,
+        )
+
+    def _build_task_loaders(self, dataset, batch_size: int, num_workers: int, shuffle: bool, drop_last: bool):
+        targets = torch.tensor(dataset.targets, dtype=torch.long)
+        loaders = []
+        for split in self.task_splits:
+            mask = torch.zeros_like(targets, dtype=torch.bool)
+            for cls in split:
+                mask = mask | (targets == cls)
+            indices = torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
+            subset = torch.utils.data.Subset(dataset, indices)
+            loader = DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                drop_last=drop_last,
+            )
+            loaders.append(loader)
+        return loaders
+
+    def get_task_eval_loaders(self):
+        return self.task_eval_loaders
 
     def iter_samples(self, total_steps: int):
+        if not self.task_loaders:
+            return
+
         step = 0
-        while step < total_steps:
-            for images, labels in self.loader:
-                for i in range(images.size(0)):
-                    if step >= total_steps:
-                        return
-                    pil_img = transforms.ToPILImage()(images[i])
-                    x = self.transform(pil_img, step=step)
-                    y = int(labels[i].item())
-                    yield StreamSample(x=x, y=y)
-                    step += 1
+        num_tasks = len(self.task_loaders)
+        base_steps_per_task = total_steps // num_tasks
+        extra = total_steps % num_tasks
+
+        for task_id, loader in enumerate(self.task_loaders):
+            steps_for_task = base_steps_per_task + (1 if task_id < extra else 0)
+            if steps_for_task <= 0:
+                continue
+
+            produced = 0
+            while produced < steps_for_task:
+                for images, labels in loader:
+                    for i in range(images.size(0)):
+                        if produced >= steps_for_task or step >= total_steps:
+                            break
+                        pil_img = transforms.ToPILImage()(images[i])
+                        x = self.transform(pil_img, step=step)
+                        y = int(labels[i].item())
+                        yield StreamSample(x=x, y=y, task_id=task_id)
+                        step += 1
+                        produced += 1
+                    if produced >= steps_for_task or step >= total_steps:
+                        break
 
 
 class DelayedLabelQueue:

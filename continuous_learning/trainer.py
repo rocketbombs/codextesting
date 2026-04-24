@@ -5,14 +5,15 @@ from collections import deque
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from continuous_learning.config import OnlineConfig
 from continuous_learning.memory import ReservoirReplayBuffer
 from continuous_learning.model import TinyCNN
-from continuous_learning.stream import DelayedLabelQueue, OnlineMNISTStream
+from continuous_learning.stream import DelayedLabelQueue, OnlineSplitCIFAR10Stream
 
 
 def set_seed(seed: int) -> None:
@@ -29,6 +30,92 @@ def setup_logger() -> None:
     )
 
 
+def smoothed_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    label_smoothing: float,
+    fallback_warned: bool,
+) -> tuple[torch.Tensor, bool]:
+    if label_smoothing <= 0.0:
+        return F.cross_entropy(logits, targets), fallback_warned
+
+    try:
+        return (
+            F.cross_entropy(logits, targets, label_smoothing=label_smoothing),
+            fallback_warned,
+        )
+    except TypeError:
+        if not fallback_warned:
+            logging.warning(
+                "torch.nn.functional.cross_entropy does not support label_smoothing "
+                "in this runtime; using manual smoothing fallback."
+            )
+            fallback_warned = True
+
+        num_classes = logits.size(1)
+        if num_classes <= 1:
+            return F.cross_entropy(logits, targets), fallback_warned
+
+        smooth = label_smoothing / (num_classes - 1)
+        true_dist = torch.full_like(logits, smooth)
+        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - label_smoothing)
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(true_dist * log_probs).sum(dim=1).mean()
+        return loss, fallback_warned
+
+
+def evaluate_task_metrics(
+    model: torch.nn.Module,
+    task_eval_loaders,
+    seen_task_count: int,
+    device: torch.device,
+    best_task_acc: dict[int, float],
+):
+    if seen_task_count <= 0:
+        return None
+
+    model.eval()
+    task_accs = []
+    total_correct = 0
+    total_count = 0
+
+    with torch.no_grad():
+        for task_id in range(seen_task_count):
+            loader = task_eval_loaders[task_id]
+            task_correct = 0
+            task_count = 0
+            for x, y in loader:
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                pred = logits.argmax(dim=1)
+                task_correct += int((pred == y).sum().item())
+                task_count += int(y.numel())
+
+            acc = (task_correct / task_count) if task_count > 0 else 0.0
+            task_accs.append(acc)
+            best_task_acc[task_id] = max(best_task_acc.get(task_id, 0.0), acc)
+            total_correct += task_correct
+            total_count += task_count
+
+    avg_task_acc = float(np.mean(task_accs)) if task_accs else 0.0
+    micro_acc = (total_correct / total_count) if total_count > 0 else 0.0
+    forgetting = float(
+        np.mean([max(0.0, best_task_acc[i] - task_accs[i]) for i in range(len(task_accs))])
+    ) if task_accs else 0.0
+    worst_task_acc = float(np.min(task_accs)) if task_accs else 0.0
+    stability_gap = float(np.max(task_accs) - np.min(task_accs)) if task_accs else 0.0
+
+    return {
+        "avg_task_acc": avg_task_acc,
+        "micro_acc": micro_acc,
+        "forgetting": forgetting,
+        "worst_task_acc": worst_task_acc,
+        "stability_gap": stability_gap,
+        "seen_tasks": seen_task_count,
+    }
+
+
 def online_train(config: OnlineConfig) -> None:
     setup_logger()
     set_seed(config.seed)
@@ -42,18 +129,31 @@ def online_train(config: OnlineConfig) -> None:
     model = TinyCNN().to(device)
     anchor_params = [p.detach().clone() for p in model.parameters()]
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
-    stream = OnlineMNISTStream(
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, config.num_steps),
+        eta_min=config.lr * config.min_lr_ratio,
+    )
+    stream = OnlineSplitCIFAR10Stream(
         data_dir=config.data_dir,
         batch_size=64,
+        eval_batch_size=config.eval_batch_size,
         num_workers=config.num_workers,
         total_steps=config.num_steps,
+        classes_per_task=config.classes_per_task,
     )
+    task_eval_loaders = stream.get_task_eval_loaders()
     label_queue = DelayedLabelQueue(delay_steps=config.delay_steps)
     replay = ReservoirReplayBuffer(capacity=config.replay_buffer_size, seed=config.seed)
+    best_task_acc: dict[int, float] = {}
 
     rolling_correct = deque(maxlen=config.eval_window)
+    last_ce = float("nan")
+    last_main_ce = float("nan")
+    last_replay_ce = float("nan")
+    last_entropy = float("nan")
+    last_entropy_reg = float("nan")
+    smoothing_fallback_warned = False
 
     pbar = tqdm(stream.iter_samples(config.num_steps), total=config.num_steps, desc="Online train")
     for step, sample in enumerate(pbar, start=1):
@@ -79,24 +179,53 @@ def online_train(config: OnlineConfig) -> None:
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                main_loss = criterion(model(rx), ry_t)
+                main_logits = model(rx)
+                main_ce, smoothing_fallback_warned = smoothed_cross_entropy(
+                    main_logits,
+                    ry_t,
+                    label_smoothing=config.label_smoothing,
+                    fallback_warned=smoothing_fallback_warned,
+                )
 
-                replay_loss = 0.0
-                replay_batch = replay.sample(config.replay_batch_size, device=device)
-                if replay_batch is not None:
+                replay_ce_sum = torch.tensor(0.0, device=device)
+                replay_ce_count = 0
+                for _ in range(max(0, config.replay_updates_per_step)):
+                    replay_batch = replay.sample(config.replay_batch_size, device=device)
+                    if replay_batch is None:
+                        continue
                     replay_x, replay_y = replay_batch
-                    replay_loss = criterion(model(replay_x), replay_y)
+                    replay_logits = model(replay_x)
+                    replay_ce_i, smoothing_fallback_warned = smoothed_cross_entropy(
+                        replay_logits,
+                        replay_y,
+                        label_smoothing=config.label_smoothing,
+                        fallback_warned=smoothing_fallback_warned,
+                    )
+                    replay_ce_sum = replay_ce_sum + replay_ce_i
+                    replay_ce_count += 1
+
+                replay_ce = replay_ce_sum / max(1, replay_ce_count)
+                ce_loss = main_ce + config.replay_loss_weight * replay_ce
+                probs = F.softmax(main_logits, dim=1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                entropy_reg = -config.entropy_lambda * entropy
 
                 l2_anchor = 0.0
                 for p, p0 in zip(model.parameters(), anchor_params):
                     l2_anchor = l2_anchor + torch.sum((p - p0.to(device)) ** 2)
 
-                loss = main_loss + 0.7 * replay_loss + config.l2_anchor_lambda * l2_anchor
+                loss = ce_loss + entropy_reg + config.l2_anchor_lambda * l2_anchor
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
                 replay.add(rx.squeeze(0), int(ry))
+                last_ce = float(ce_loss.item())
+                last_main_ce = float(main_ce.item())
+                last_replay_ce = float(replay_ce.item())
+                last_entropy = float(entropy.item())
+                last_entropy_reg = float(entropy_reg.item())
 
         if step % config.log_every == 0:
             rolling_acc = np.mean(rolling_correct) * 100 if rolling_correct else 0.0
@@ -104,13 +233,41 @@ def online_train(config: OnlineConfig) -> None:
                 rolling_acc=f"{rolling_acc:.2f}%",
                 replay_size=len(replay),
                 delay=config.delay_steps,
+                task=sample.task_id,
             )
             logging.info(
-                "step=%d rolling_acc=%.2f%% replay_size=%d",
+                "step=%d task=%d rolling_acc=%.2f%% replay_size=%d lr=%.6e ce=%.4f main_ce=%.4f replay_ce=%.4f entropy=%.4f entropy_reg=%.6f",
                 step,
+                sample.task_id,
                 rolling_acc,
                 len(replay),
+                optimizer.param_groups[0]["lr"],
+                last_ce,
+                last_main_ce,
+                last_replay_ce,
+                last_entropy,
+                last_entropy_reg,
             )
+
+        if config.task_eval_every > 0 and step % config.task_eval_every == 0:
+            metrics = evaluate_task_metrics(
+                model=model,
+                task_eval_loaders=task_eval_loaders,
+                seen_task_count=sample.task_id + 1,
+                device=device,
+                best_task_acc=best_task_acc,
+            )
+            if metrics is not None:
+                logging.info(
+                    "eval step=%d seen_tasks=%d avg_task_acc=%.2f%% micro_acc=%.2f%% forgetting=%.2fpp worst_task_acc=%.2f%% stability_gap=%.2fpp",
+                    step,
+                    metrics["seen_tasks"],
+                    metrics["avg_task_acc"] * 100.0,
+                    metrics["micro_acc"] * 100.0,
+                    metrics["forgetting"] * 100.0,
+                    metrics["worst_task_acc"] * 100.0,
+                    metrics["stability_gap"] * 100.0,
+                )
 
         if step % config.save_every == 0:
             ckpt_path = os.path.join(config.ckpt_dir, f"step_{step}.pt")

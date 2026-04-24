@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
 from continuous_learning.config import OnlineConfig
@@ -76,6 +77,11 @@ def online_train(config: OnlineConfig) -> None:
     model = TinyCNN().to(device)
     anchor_params = [p.detach().clone() for p in model.parameters()]
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, config.num_steps),
+        eta_min=config.lr * config.min_lr_ratio,
+    )
     stream = OnlineMNISTStream(
         data_dir=config.data_dir,
         batch_size=64,
@@ -87,6 +93,8 @@ def online_train(config: OnlineConfig) -> None:
 
     rolling_correct = deque(maxlen=config.eval_window)
     last_ce = float("nan")
+    last_main_ce = float("nan")
+    last_replay_ce = float("nan")
     last_entropy = float("nan")
     last_entropy_reg = float("nan")
     smoothing_fallback_warned = False
@@ -123,19 +131,25 @@ def online_train(config: OnlineConfig) -> None:
                     fallback_warned=smoothing_fallback_warned,
                 )
 
-                replay_ce = torch.tensor(0.0, device=device)
-                replay_batch = replay.sample(config.replay_batch_size, device=device)
-                if replay_batch is not None:
+                replay_ce_sum = torch.tensor(0.0, device=device)
+                replay_ce_count = 0
+                for _ in range(max(0, config.replay_updates_per_step)):
+                    replay_batch = replay.sample(config.replay_batch_size, device=device)
+                    if replay_batch is None:
+                        continue
                     replay_x, replay_y = replay_batch
                     replay_logits = model(replay_x)
-                    replay_ce, smoothing_fallback_warned = smoothed_cross_entropy(
+                    replay_ce_i, smoothing_fallback_warned = smoothed_cross_entropy(
                         replay_logits,
                         replay_y,
                         label_smoothing=config.label_smoothing,
                         fallback_warned=smoothing_fallback_warned,
                     )
+                    replay_ce_sum = replay_ce_sum + replay_ce_i
+                    replay_ce_count += 1
 
-                ce_loss = main_ce + 0.7 * replay_ce
+                replay_ce = replay_ce_sum / max(1, replay_ce_count)
+                ce_loss = main_ce + config.replay_loss_weight * replay_ce
                 probs = F.softmax(main_logits, dim=1)
                 entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
                 entropy_reg = -config.entropy_lambda * entropy
@@ -148,9 +162,12 @@ def online_train(config: OnlineConfig) -> None:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
+                scheduler.step()
 
                 replay.add(rx.squeeze(0), int(ry))
                 last_ce = float(ce_loss.item())
+                last_main_ce = float(main_ce.item())
+                last_replay_ce = float(replay_ce.item())
                 last_entropy = float(entropy.item())
                 last_entropy_reg = float(entropy_reg.item())
 
@@ -162,11 +179,14 @@ def online_train(config: OnlineConfig) -> None:
                 delay=config.delay_steps,
             )
             logging.info(
-                "step=%d rolling_acc=%.2f%% replay_size=%d ce=%.4f entropy=%.4f entropy_reg=%.6f",
+                "step=%d rolling_acc=%.2f%% replay_size=%d lr=%.6e ce=%.4f main_ce=%.4f replay_ce=%.4f entropy=%.4f entropy_reg=%.6f",
                 step,
                 rolling_acc,
                 len(replay),
+                optimizer.param_groups[0]["lr"],
                 last_ce,
+                last_main_ce,
+                last_replay_ce,
                 last_entropy,
                 last_entropy_reg,
             )

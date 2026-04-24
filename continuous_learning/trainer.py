@@ -13,7 +13,7 @@ from tqdm import tqdm
 from continuous_learning.config import OnlineConfig
 from continuous_learning.memory import ReservoirReplayBuffer
 from continuous_learning.model import TinyCNN
-from continuous_learning.stream import DelayedLabelQueue, OnlineMNISTStream
+from continuous_learning.stream import DelayedLabelQueue, OnlineSplitCIFAR10Stream
 
 
 def set_seed(seed: int) -> None:
@@ -82,11 +82,12 @@ def online_train(config: OnlineConfig) -> None:
         T_max=max(1, config.num_steps),
         eta_min=config.lr * config.min_lr_ratio,
     )
-    stream = OnlineMNISTStream(
+    stream = OnlineSplitCIFAR10Stream(
         data_dir=config.data_dir,
         batch_size=64,
         num_workers=config.num_workers,
         total_steps=config.num_steps,
+        classes_per_task=config.classes_per_task,
     )
     label_queue = DelayedLabelQueue(delay_steps=config.delay_steps)
     replay = ReservoirReplayBuffer(capacity=config.replay_buffer_size, seed=config.seed)
@@ -177,10 +178,12 @@ def online_train(config: OnlineConfig) -> None:
                 rolling_acc=f"{rolling_acc:.2f}%",
                 replay_size=len(replay),
                 delay=config.delay_steps,
+                task=sample.task_id,
             )
             logging.info(
-                "step=%d rolling_acc=%.2f%% replay_size=%d lr=%.6e ce=%.4f main_ce=%.4f replay_ce=%.4f entropy=%.4f entropy_reg=%.6f",
+                "step=%d task=%d rolling_acc=%.2f%% replay_size=%d lr=%.6e ce=%.4f main_ce=%.4f replay_ce=%.4f entropy=%.4f entropy_reg=%.6f",
                 step,
+                sample.task_id,
                 rolling_acc,
                 len(replay),
                 optimizer.param_groups[0]["lr"],

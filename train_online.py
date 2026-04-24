@@ -5,8 +5,9 @@ from continuous_learning.trainer import online_train
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Online continuous learning on MNIST stream")
+    parser = argparse.ArgumentParser(description="Online continuous learning on Split-CIFAR10 stream")
     parser.add_argument("--num-steps", type=int, default=20_000)
+    parser.add_argument("--classes-per-task", type=int, default=2)
     parser.add_argument("--delay-steps", type=int, default=25)
     parser.add_argument("--replay-buffer-size", type=int, default=5_000)
     parser.add_argument("--replay-batch-size", type=int, default=32)
@@ -28,6 +29,7 @@ def main() -> None:
     args = parse_args()
     cfg = OnlineConfig(
         num_steps=args.num_steps,
+        classes_per_task=args.classes_per_task,
         delay_steps=args.delay_steps,
         replay_buffer_size=args.replay_buffer_size,
         replay_batch_size=args.replay_batch_size,

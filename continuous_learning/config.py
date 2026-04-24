@@ -4,6 +4,7 @@ from dataclasses import dataclass
 @dataclass
 class OnlineConfig:
     data_dir: str = "./data"
+    classes_per_task: int = 2
     num_steps: int = 20_000
     eval_window: int = 500
     replay_buffer_size: int = 5_000

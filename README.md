@@ -1,10 +1,10 @@
-# Toy Continuous Learning (Train During Inference)
+# Toy Continuous Learning on Split-CIFAR10 (Train During Inference)
 
 This repository contains a lightweight continuous learning pipeline built from scratch for local GPU training (e.g., RTX 5080).
 
 ## What it does
 
-- Streams MNIST samples one by one.
+- Streams Split-CIFAR10 samples one by one (class-incremental tasks).
 - Runs inference first (prequential evaluation).
 - Receives labels with delay (`--delay-steps`).
 - Performs online updates using:
@@ -26,6 +26,7 @@ pip install -r requirements.txt
 ```bash
 python train_online.py \
   --num-steps 20000 \
+  --classes-per-task 2 \
   --delay-steps 25 \
   --replay-buffer-size 5000 \
   --replay-batch-size 32 \
@@ -45,6 +46,7 @@ python train_online.py --num-steps 300 --log-every 50 --save-every 300
 - Checkpoints in `./checkpoints/` (`step_*.pt` and `final.pt`).
 - Progress bar with rolling accuracy and replay size.
 - Structured logs with step metrics.
+- Task id in logs/postfix for Split-CIFAR10 phase tracking.
 
 ## Notes
 

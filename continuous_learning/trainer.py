@@ -5,7 +5,7 @@ from collections import deque
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 
@@ -42,8 +42,6 @@ def online_train(config: OnlineConfig) -> None:
     model = TinyCNN().to(device)
     anchor_params = [p.detach().clone() for p in model.parameters()]
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
     stream = OnlineMNISTStream(
         data_dir=config.data_dir,
         batch_size=64,
@@ -54,6 +52,9 @@ def online_train(config: OnlineConfig) -> None:
     replay = ReservoirReplayBuffer(capacity=config.replay_buffer_size, seed=config.seed)
 
     rolling_correct = deque(maxlen=config.eval_window)
+    last_ce = float("nan")
+    last_entropy = float("nan")
+    last_entropy_reg = float("nan")
 
     pbar = tqdm(stream.iter_samples(config.num_steps), total=config.num_steps, desc="Online train")
     for step, sample in enumerate(pbar, start=1):
@@ -79,24 +80,42 @@ def online_train(config: OnlineConfig) -> None:
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                main_loss = criterion(model(rx), ry_t)
+                main_logits = model(rx)
+                main_ce = F.cross_entropy(
+                    main_logits,
+                    ry_t,
+                    label_smoothing=config.label_smoothing,
+                )
 
-                replay_loss = 0.0
+                replay_ce = torch.tensor(0.0, device=device)
                 replay_batch = replay.sample(config.replay_batch_size, device=device)
                 if replay_batch is not None:
                     replay_x, replay_y = replay_batch
-                    replay_loss = criterion(model(replay_x), replay_y)
+                    replay_logits = model(replay_x)
+                    replay_ce = F.cross_entropy(
+                        replay_logits,
+                        replay_y,
+                        label_smoothing=config.label_smoothing,
+                    )
+
+                ce_loss = main_ce + 0.7 * replay_ce
+                probs = F.softmax(main_logits, dim=1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                entropy_reg = -config.entropy_lambda * entropy
 
                 l2_anchor = 0.0
                 for p, p0 in zip(model.parameters(), anchor_params):
                     l2_anchor = l2_anchor + torch.sum((p - p0.to(device)) ** 2)
 
-                loss = main_loss + 0.7 * replay_loss + config.l2_anchor_lambda * l2_anchor
+                loss = ce_loss + entropy_reg + config.l2_anchor_lambda * l2_anchor
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
                 replay.add(rx.squeeze(0), int(ry))
+                last_ce = float(ce_loss.item())
+                last_entropy = float(entropy.item())
+                last_entropy_reg = float(entropy_reg.item())
 
         if step % config.log_every == 0:
             rolling_acc = np.mean(rolling_correct) * 100 if rolling_correct else 0.0
@@ -106,10 +125,13 @@ def online_train(config: OnlineConfig) -> None:
                 delay=config.delay_steps,
             )
             logging.info(
-                "step=%d rolling_acc=%.2f%% replay_size=%d",
+                "step=%d rolling_acc=%.2f%% replay_size=%d ce=%.4f entropy=%.4f entropy_reg=%.6f",
                 step,
                 rolling_acc,
                 len(replay),
+                last_ce,
+                last_entropy,
+                last_entropy_reg,
             )
 
         if step % config.save_every == 0:

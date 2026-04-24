@@ -16,6 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.05)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--entropy-lambda", type=float, default=1e-4)
+    parser.add_argument("--replay-loss-weight", type=float, default=1.0)
+    parser.add_argument("--replay-updates-per-step", type=int, default=2)
     return parser.parse_args()
 
 
@@ -32,6 +37,11 @@ def main() -> None:
         ckpt_dir=args.ckpt_dir,
         device=args.device,
         lr=args.lr,
+        min_lr_ratio=args.min_lr_ratio,
+        label_smoothing=args.label_smoothing,
+        entropy_lambda=args.entropy_lambda,
+        replay_loss_weight=args.replay_loss_weight,
+        replay_updates_per_step=args.replay_updates_per_step,
     )
     online_train(cfg)
 

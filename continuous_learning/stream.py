@@ -51,7 +51,15 @@ class StreamSample:
 class OnlineMNISTStream:
     def __init__(self, data_dir: str, batch_size: int, num_workers: int, total_steps: int) -> None:
         self.transform = ProgressiveDriftTransform(total_steps=total_steps)
-        self.dataset = datasets.MNIST(root=data_dir, train=True, download=True)
+        # Ensure DataLoader workers collate tensors instead of PIL Images.
+        # Without this, newer torch/torchvision stacks can fail with:
+        # "default_collate ... found <class 'PIL.Image.Image'>".
+        self.dataset = datasets.MNIST(
+            root=data_dir,
+            train=True,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
         self.loader = DataLoader(
             self.dataset,
             batch_size=batch_size,

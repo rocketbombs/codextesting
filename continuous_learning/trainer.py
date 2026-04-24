@@ -29,6 +29,40 @@ def setup_logger() -> None:
     )
 
 
+def smoothed_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    label_smoothing: float,
+    fallback_warned: bool,
+) -> tuple[torch.Tensor, bool]:
+    if label_smoothing <= 0.0:
+        return F.cross_entropy(logits, targets), fallback_warned
+
+    try:
+        return (
+            F.cross_entropy(logits, targets, label_smoothing=label_smoothing),
+            fallback_warned,
+        )
+    except TypeError:
+        if not fallback_warned:
+            logging.warning(
+                "torch.nn.functional.cross_entropy does not support label_smoothing "
+                "in this runtime; using manual smoothing fallback."
+            )
+            fallback_warned = True
+
+        num_classes = logits.size(1)
+        if num_classes <= 1:
+            return F.cross_entropy(logits, targets), fallback_warned
+
+        smooth = label_smoothing / (num_classes - 1)
+        true_dist = torch.full_like(logits, smooth)
+        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - label_smoothing)
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(true_dist * log_probs).sum(dim=1).mean()
+        return loss, fallback_warned
+
+
 def online_train(config: OnlineConfig) -> None:
     setup_logger()
     set_seed(config.seed)
@@ -55,6 +89,7 @@ def online_train(config: OnlineConfig) -> None:
     last_ce = float("nan")
     last_entropy = float("nan")
     last_entropy_reg = float("nan")
+    smoothing_fallback_warned = False
 
     pbar = tqdm(stream.iter_samples(config.num_steps), total=config.num_steps, desc="Online train")
     for step, sample in enumerate(pbar, start=1):
@@ -81,10 +116,11 @@ def online_train(config: OnlineConfig) -> None:
                 optimizer.zero_grad(set_to_none=True)
 
                 main_logits = model(rx)
-                main_ce = F.cross_entropy(
+                main_ce, smoothing_fallback_warned = smoothed_cross_entropy(
                     main_logits,
                     ry_t,
                     label_smoothing=config.label_smoothing,
+                    fallback_warned=smoothing_fallback_warned,
                 )
 
                 replay_ce = torch.tensor(0.0, device=device)
@@ -92,10 +128,11 @@ def online_train(config: OnlineConfig) -> None:
                 if replay_batch is not None:
                     replay_x, replay_y = replay_batch
                     replay_logits = model(replay_x)
-                    replay_ce = F.cross_entropy(
+                    replay_ce, smoothing_fallback_warned = smoothed_cross_entropy(
                         replay_logits,
                         replay_y,
                         label_smoothing=config.label_smoothing,
+                        fallback_warned=smoothing_fallback_warned,
                     )
 
                 ce_loss = main_ce + 0.7 * replay_ce

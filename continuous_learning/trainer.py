@@ -5,7 +5,7 @@ from collections import deque
 
 import numpy as np
 import torch
-from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW
 from tqdm import tqdm
 
@@ -29,6 +29,40 @@ def setup_logger() -> None:
     )
 
 
+def smoothed_cross_entropy(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    label_smoothing: float,
+    fallback_warned: bool,
+) -> tuple[torch.Tensor, bool]:
+    if label_smoothing <= 0.0:
+        return F.cross_entropy(logits, targets), fallback_warned
+
+    try:
+        return (
+            F.cross_entropy(logits, targets, label_smoothing=label_smoothing),
+            fallback_warned,
+        )
+    except TypeError:
+        if not fallback_warned:
+            logging.warning(
+                "torch.nn.functional.cross_entropy does not support label_smoothing "
+                "in this runtime; using manual smoothing fallback."
+            )
+            fallback_warned = True
+
+        num_classes = logits.size(1)
+        if num_classes <= 1:
+            return F.cross_entropy(logits, targets), fallback_warned
+
+        smooth = label_smoothing / (num_classes - 1)
+        true_dist = torch.full_like(logits, smooth)
+        true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - label_smoothing)
+        log_probs = F.log_softmax(logits, dim=1)
+        loss = -(true_dist * log_probs).sum(dim=1).mean()
+        return loss, fallback_warned
+
+
 def online_train(config: OnlineConfig) -> None:
     setup_logger()
     set_seed(config.seed)
@@ -42,8 +76,6 @@ def online_train(config: OnlineConfig) -> None:
     model = TinyCNN().to(device)
     anchor_params = [p.detach().clone() for p in model.parameters()]
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    criterion = nn.CrossEntropyLoss()
-
     stream = OnlineMNISTStream(
         data_dir=config.data_dir,
         batch_size=64,
@@ -54,6 +86,10 @@ def online_train(config: OnlineConfig) -> None:
     replay = ReservoirReplayBuffer(capacity=config.replay_buffer_size, seed=config.seed)
 
     rolling_correct = deque(maxlen=config.eval_window)
+    last_ce = float("nan")
+    last_entropy = float("nan")
+    last_entropy_reg = float("nan")
+    smoothing_fallback_warned = False
 
     pbar = tqdm(stream.iter_samples(config.num_steps), total=config.num_steps, desc="Online train")
     for step, sample in enumerate(pbar, start=1):
@@ -79,24 +115,44 @@ def online_train(config: OnlineConfig) -> None:
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                main_loss = criterion(model(rx), ry_t)
+                main_logits = model(rx)
+                main_ce, smoothing_fallback_warned = smoothed_cross_entropy(
+                    main_logits,
+                    ry_t,
+                    label_smoothing=config.label_smoothing,
+                    fallback_warned=smoothing_fallback_warned,
+                )
 
-                replay_loss = 0.0
+                replay_ce = torch.tensor(0.0, device=device)
                 replay_batch = replay.sample(config.replay_batch_size, device=device)
                 if replay_batch is not None:
                     replay_x, replay_y = replay_batch
-                    replay_loss = criterion(model(replay_x), replay_y)
+                    replay_logits = model(replay_x)
+                    replay_ce, smoothing_fallback_warned = smoothed_cross_entropy(
+                        replay_logits,
+                        replay_y,
+                        label_smoothing=config.label_smoothing,
+                        fallback_warned=smoothing_fallback_warned,
+                    )
+
+                ce_loss = main_ce + 0.7 * replay_ce
+                probs = F.softmax(main_logits, dim=1)
+                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=1).mean()
+                entropy_reg = -config.entropy_lambda * entropy
 
                 l2_anchor = 0.0
                 for p, p0 in zip(model.parameters(), anchor_params):
                     l2_anchor = l2_anchor + torch.sum((p - p0.to(device)) ** 2)
 
-                loss = main_loss + 0.7 * replay_loss + config.l2_anchor_lambda * l2_anchor
+                loss = ce_loss + entropy_reg + config.l2_anchor_lambda * l2_anchor
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
                 replay.add(rx.squeeze(0), int(ry))
+                last_ce = float(ce_loss.item())
+                last_entropy = float(entropy.item())
+                last_entropy_reg = float(entropy_reg.item())
 
         if step % config.log_every == 0:
             rolling_acc = np.mean(rolling_correct) * 100 if rolling_correct else 0.0
@@ -106,10 +162,13 @@ def online_train(config: OnlineConfig) -> None:
                 delay=config.delay_steps,
             )
             logging.info(
-                "step=%d rolling_acc=%.2f%% replay_size=%d",
+                "step=%d rolling_acc=%.2f%% replay_size=%d ce=%.4f entropy=%.4f entropy_reg=%.6f",
                 step,
                 rolling_acc,
                 len(replay),
+                last_ce,
+                last_entropy,
+                last_entropy_reg,
             )
 
         if step % config.save_every == 0:

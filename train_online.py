@@ -16,6 +16,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-dir", type=str, default="./checkpoints")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--entropy-lambda", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -32,6 +34,8 @@ def main() -> None:
         ckpt_dir=args.ckpt_dir,
         device=args.device,
         lr=args.lr,
+        label_smoothing=args.label_smoothing,
+        entropy_lambda=args.entropy_lambda,
     )
     online_train(cfg)
 

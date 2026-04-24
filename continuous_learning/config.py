@@ -13,6 +13,8 @@ class OnlineConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     l2_anchor_lambda: float = 1e-4
+    label_smoothing: float = 0.05
+    entropy_lambda: float = 1e-4
     num_workers: int = 2
     device: str = "cuda"
     seed: int = 42

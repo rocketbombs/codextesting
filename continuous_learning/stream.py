@@ -54,14 +54,21 @@ class OnlineSplitCIFAR10Stream:
         self,
         data_dir: str,
         batch_size: int,
+        eval_batch_size: int,
         num_workers: int,
         total_steps: int,
         classes_per_task: int,
     ) -> None:
         self.transform = ProgressiveDriftTransform(total_steps=total_steps)
-        self.dataset = datasets.CIFAR10(
+        self.train_dataset = datasets.CIFAR10(
             root=data_dir,
             train=True,
+            download=True,
+            transform=transforms.ToTensor(),
+        )
+        self.test_dataset = datasets.CIFAR10(
+            root=data_dir,
+            train=False,
             download=True,
             transform=transforms.ToTensor(),
         )
@@ -72,22 +79,42 @@ class OnlineSplitCIFAR10Stream:
             for i in range(0, len(class_order), self.classes_per_task)
         ]
 
-        targets = torch.tensor(self.dataset.targets, dtype=torch.long)
-        self.task_loaders = []
+        self.task_loaders = self._build_task_loaders(
+            dataset=self.train_dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=True,
+            drop_last=True,
+        )
+        self.task_eval_loaders = self._build_task_loaders(
+            dataset=self.test_dataset,
+            batch_size=eval_batch_size,
+            num_workers=num_workers,
+            shuffle=False,
+            drop_last=False,
+        )
+
+    def _build_task_loaders(self, dataset, batch_size: int, num_workers: int, shuffle: bool, drop_last: bool):
+        targets = torch.tensor(dataset.targets, dtype=torch.long)
+        loaders = []
         for split in self.task_splits:
             mask = torch.zeros_like(targets, dtype=torch.bool)
             for cls in split:
                 mask = mask | (targets == cls)
             indices = torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
-            subset = torch.utils.data.Subset(self.dataset, indices)
+            subset = torch.utils.data.Subset(dataset, indices)
             loader = DataLoader(
                 subset,
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=shuffle,
                 num_workers=num_workers,
-                drop_last=True,
+                drop_last=drop_last,
             )
-            self.task_loaders.append(loader)
+            loaders.append(loader)
+        return loaders
+
+    def get_task_eval_loaders(self):
+        return self.task_eval_loaders
 
     def iter_samples(self, total_steps: int):
         if not self.task_loaders:

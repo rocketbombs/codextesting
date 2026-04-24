@@ -27,6 +27,7 @@ pip install -r requirements.txt
 python train_online.py \
   --num-steps 20000 \
   --classes-per-task 2 \
+  --task-eval-every 1000 \
   --delay-steps 25 \
   --replay-buffer-size 5000 \
   --replay-batch-size 32 \
@@ -47,6 +48,7 @@ python train_online.py --num-steps 300 --log-every 50 --save-every 300
 - Progress bar with rolling accuracy and replay size.
 - Structured logs with step metrics.
 - Task id in logs/postfix for Split-CIFAR10 phase tracking.
+- Periodic Split-task validation metrics: average task accuracy, micro accuracy, forgetting, worst task accuracy, and stability gap.
 
 ## Notes
 

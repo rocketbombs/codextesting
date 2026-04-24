@@ -64,6 +64,58 @@ def smoothed_cross_entropy(
         return loss, fallback_warned
 
 
+def evaluate_task_metrics(
+    model: torch.nn.Module,
+    task_eval_loaders,
+    seen_task_count: int,
+    device: torch.device,
+    best_task_acc: dict[int, float],
+):
+    if seen_task_count <= 0:
+        return None
+
+    model.eval()
+    task_accs = []
+    total_correct = 0
+    total_count = 0
+
+    with torch.no_grad():
+        for task_id in range(seen_task_count):
+            loader = task_eval_loaders[task_id]
+            task_correct = 0
+            task_count = 0
+            for x, y in loader:
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                pred = logits.argmax(dim=1)
+                task_correct += int((pred == y).sum().item())
+                task_count += int(y.numel())
+
+            acc = (task_correct / task_count) if task_count > 0 else 0.0
+            task_accs.append(acc)
+            best_task_acc[task_id] = max(best_task_acc.get(task_id, 0.0), acc)
+            total_correct += task_correct
+            total_count += task_count
+
+    avg_task_acc = float(np.mean(task_accs)) if task_accs else 0.0
+    micro_acc = (total_correct / total_count) if total_count > 0 else 0.0
+    forgetting = float(
+        np.mean([max(0.0, best_task_acc[i] - task_accs[i]) for i in range(len(task_accs))])
+    ) if task_accs else 0.0
+    worst_task_acc = float(np.min(task_accs)) if task_accs else 0.0
+    stability_gap = float(np.max(task_accs) - np.min(task_accs)) if task_accs else 0.0
+
+    return {
+        "avg_task_acc": avg_task_acc,
+        "micro_acc": micro_acc,
+        "forgetting": forgetting,
+        "worst_task_acc": worst_task_acc,
+        "stability_gap": stability_gap,
+        "seen_tasks": seen_task_count,
+    }
+
+
 def online_train(config: OnlineConfig) -> None:
     setup_logger()
     set_seed(config.seed)
@@ -85,12 +137,15 @@ def online_train(config: OnlineConfig) -> None:
     stream = OnlineSplitCIFAR10Stream(
         data_dir=config.data_dir,
         batch_size=64,
+        eval_batch_size=config.eval_batch_size,
         num_workers=config.num_workers,
         total_steps=config.num_steps,
         classes_per_task=config.classes_per_task,
     )
+    task_eval_loaders = stream.get_task_eval_loaders()
     label_queue = DelayedLabelQueue(delay_steps=config.delay_steps)
     replay = ReservoirReplayBuffer(capacity=config.replay_buffer_size, seed=config.seed)
+    best_task_acc: dict[int, float] = {}
 
     rolling_correct = deque(maxlen=config.eval_window)
     last_ce = float("nan")
@@ -193,6 +248,26 @@ def online_train(config: OnlineConfig) -> None:
                 last_entropy,
                 last_entropy_reg,
             )
+
+        if config.task_eval_every > 0 and step % config.task_eval_every == 0:
+            metrics = evaluate_task_metrics(
+                model=model,
+                task_eval_loaders=task_eval_loaders,
+                seen_task_count=sample.task_id + 1,
+                device=device,
+                best_task_acc=best_task_acc,
+            )
+            if metrics is not None:
+                logging.info(
+                    "eval step=%d seen_tasks=%d avg_task_acc=%.2f%% micro_acc=%.2f%% forgetting=%.2fpp worst_task_acc=%.2f%% stability_gap=%.2fpp",
+                    step,
+                    metrics["seen_tasks"],
+                    metrics["avg_task_acc"] * 100.0,
+                    metrics["micro_acc"] * 100.0,
+                    metrics["forgetting"] * 100.0,
+                    metrics["worst_task_acc"] * 100.0,
+                    metrics["stability_gap"] * 100.0,
+                )
 
         if step % config.save_every == 0:
             ckpt_path = os.path.join(config.ckpt_dir, f"step_{step}.pt")

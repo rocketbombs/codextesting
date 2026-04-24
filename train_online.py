@@ -11,6 +11,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--delay-steps", type=int, default=25)
     parser.add_argument("--replay-buffer-size", type=int, default=5_000)
     parser.add_argument("--replay-batch-size", type=int, default=32)
+    parser.add_argument("--task-eval-every", type=int, default=1_000)
+    parser.add_argument("--eval-batch-size", type=int, default=256)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--save-every", type=int, default=2_000)
     parser.add_argument("--data-dir", type=str, default="./data")
@@ -33,6 +35,8 @@ def main() -> None:
         delay_steps=args.delay_steps,
         replay_buffer_size=args.replay_buffer_size,
         replay_batch_size=args.replay_batch_size,
+        task_eval_every=args.task_eval_every,
+        eval_batch_size=args.eval_batch_size,
         log_every=args.log_every,
         save_every=args.save_every,
         data_dir=args.data_dir,

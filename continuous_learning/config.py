@@ -7,6 +7,8 @@ class OnlineConfig:
     classes_per_task: int = 2
     num_steps: int = 20_000
     eval_window: int = 500
+    task_eval_every: int = 1_000
+    eval_batch_size: int = 256
     replay_buffer_size: int = 5_000
     replay_batch_size: int = 32
     update_every: int = 1

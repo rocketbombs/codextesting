@@ -43,6 +43,18 @@ If you run into platform-specific DataLoader worker issues on Windows, retry wit
 python train_online.py --num-steps 300 --log-every 50 --save-every 300
 ```
 
+For tiny runs (e.g., `--num-steps 5`), the default `--delay-steps 25` means labels arrive too late for meaningful online updates during the stream. For a short sanity check that actually learns, use:
+
+```bash
+python train_online.py --num-steps 200 --delay-steps 5 --log-every 20 --save-every 200
+```
+
+For a better learning curve, run longer:
+
+```bash
+python train_online.py --num-steps 20000 --delay-steps 25 --log-every 100 --save-every 2000
+```
+
 ## Outputs
 
 - Checkpoints in `./checkpoints/` (`step_*.pt` and `final.pt`).
